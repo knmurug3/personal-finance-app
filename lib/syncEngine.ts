@@ -1,12 +1,13 @@
 import { db } from "@/lib/db";
 import { isPlaidConfigured, plaidClient, fetchTransactionChanges } from "@/lib/plaid";
 import { normalizeTransactionDate, findExistingTransaction } from "@/lib/plaidMatch";
-import { mapPlaidCategoryToStandard } from "@/lib/categoryMapper";
+import { mapPlaidCategoryToStandard, mapPersonalFinanceCategory } from "@/lib/categoryMapper";
 import type { CategoryRule, Prisma } from "@prisma/client";
 import { plaidAccessToken } from "@/lib/plaidToken";
 import { detectAndSyncSubscriptions } from "@/lib/subscriptionDetector";
 import { checkBudgetAlerts } from "@/lib/budgetAlerts";
 import { reportError, errorText } from "@/lib/errorReport";
+import { withItemSyncLock } from "@/lib/syncLock";
 import { checkForecastAlert } from "@/lib/forecastData";
 import { syncInvestmentsForItem, recordPortfolioSnapshot, type InvestmentSyncStatus } from "@/lib/investmentSync";
 
@@ -28,9 +29,9 @@ export interface SyncResult {
  * Shared by the manual sync endpoint, the scheduled cron job and Plaid webhooks.
  */
 export async function syncBankItems(opts: { plaidItemId?: string } = {}): Promise<SyncResult> {
+  // Revoked connections (USER_PERMISSION_REVOKED) can never sync again; skip them until relinked
   const bankItems = await db.bankItem.findMany({
-    where: opts.plaidItemId ? { itemId: opts.plaidItemId } : undefined,
-    include: { accounts: true },
+    where: { ...(opts.plaidItemId ? { itemId: opts.plaidItemId } : {}), status: { not: "disconnected" } },
   });
 
   if (bankItems.length === 0) {
@@ -47,6 +48,8 @@ export async function syncBankItems(opts: { plaidItemId?: string } = {}): Promis
 
   let syncedItemsCount = 0;
   let syncedTransactionsCount = 0;
+  // Added, modified and removed rows: any of them can change bills, budgets and the forecast
+  let changedTransactionsCount = 0;
   const failedItems: string[] = [];
   const addedTransactions: { name: string; amount: number }[] = [];
   const investments: Record<string, InvestmentSyncStatus> = {};
@@ -62,188 +65,198 @@ export async function syncBankItems(opts: { plaidItemId?: string } = {}): Promis
     return null;
   }
 
-  for (const item of bankItems) {
-    if (item.itemId.startsWith("mock_bank")) {
+  for (const listed of bankItems) {
+    if (listed.itemId.startsWith("mock_bank")) {
       syncedItemsCount++;
       continue;
     }
 
     if (!isPlaidConfigured) continue;
 
-    try {
-      // Decrypt access token for use with Plaid API (HIGH-02 fix)
-      const rawAccessToken = await plaidAccessToken(item);
+    // One run per item at a time; each pass re-reads the item for the latest cursor and token
+    let ok = true;
+    const ran = await withItemSyncLock(listed.id, async () => {
+      const item = await db.bankItem.findUnique({ where: { id: listed.id } });
+      if (!item) return;
+      try {
+        // Decrypt access token for use with Plaid API (HIGH-02 fix)
+        const rawAccessToken = await plaidAccessToken(item);
 
-      const accountsResponse = await plaidClient.accountsGet({
-        access_token: rawAccessToken,
-      });
+        const accountsResponse = await plaidClient.accountsGet({
+          access_token: rawAccessToken,
+        });
 
-      // Point items linked before webhooks were configured at the webhook route
-      const webhookUrl = process.env.PLAID_WEBHOOK_URL;
-      if (webhookUrl && accountsResponse.data.item.webhook !== webhookUrl) {
-        await plaidClient
-          .itemWebhookUpdate({ access_token: rawAccessToken, webhook: webhookUrl })
-          .catch((err) => console.error("Failed to register Plaid webhook:", err?.response?.data?.error_code || err));
-      }
+        // Point items linked before webhooks were configured at the webhook route
+        const webhookUrl = process.env.PLAID_WEBHOOK_URL;
+        if (webhookUrl && accountsResponse.data.item.webhook !== webhookUrl) {
+          await plaidClient
+            .itemWebhookUpdate({ access_token: rawAccessToken, webhook: webhookUrl })
+            .catch((err) => console.error("Failed to register Plaid webhook:", err?.response?.data?.error_code || err));
+        }
 
-      // Upsert: accounts newly shared through Link account selection must be created, not updated
-      for (const acc of accountsResponse.data.accounts) {
-        const balances = {
-          currentBalance: acc.balances.current ?? 0,
-          availableBalance: acc.balances.available ?? acc.balances.current ?? 0,
-        };
-        await db.account.upsert({
-          where: { plaidAccountId: acc.account_id },
-          update: balances,
-          create: {
-            bankItemId: item.id,
-            plaidAccountId: acc.account_id,
-            name: acc.name,
-            officialName: acc.official_name ?? null,
-            type: String(acc.type),
-            subtype: acc.subtype ? String(acc.subtype) : null,
-            mask: acc.mask ?? null,
-            isoCurrencyCode: acc.balances.iso_currency_code || "USD",
-            ...balances,
+        // Upsert: accounts newly shared through Link account selection must be created, not updated
+        for (const acc of accountsResponse.data.accounts) {
+          const balances = {
+            currentBalance: acc.balances.current ?? 0,
+            availableBalance: acc.balances.available ?? acc.balances.current ?? 0,
+          };
+          await db.account.upsert({
+            where: { plaidAccountId: acc.account_id },
+            update: balances,
+            create: {
+              bankItemId: item.id,
+              plaidAccountId: acc.account_id,
+              name: acc.name,
+              officialName: acc.official_name ?? null,
+              type: String(acc.type),
+              subtype: acc.subtype ? String(acc.subtype) : null,
+              mask: acc.mask ?? null,
+              isoCurrencyCode: acc.balances.iso_currency_code || "USD",
+              ...balances,
+            },
+          });
+        }
+
+        // Incremental changes since the last sync (first run after this upgrade = full history)
+        const changes = await fetchTransactionChanges(rawAccessToken, item.transactionsCursor);
+
+        const dbAccounts = await db.account.findMany({
+          where: { bankItemId: item.id },
+        });
+        const dbAccountIds = dbAccounts.map((a) => a.id);
+        const dbAccountByPlaid = new Map(dbAccounts.map((a) => [a.plaidAccountId, a]));
+
+        // Only load rows the changes can touch: same Plaid ids, the pending rows they may
+        // replace (by pending_transaction_id or proximity match), and removed ids.
+        const incoming = [...changes.added, ...changes.modified];
+        const referencedIds = [
+          ...incoming.map((t) => t.transaction_id),
+          ...(incoming.map((t) => t.pending_transaction_id).filter(Boolean) as string[]),
+        ];
+        const existingTxs = await db.transaction.findMany({
+          where: {
+            accountId: { in: dbAccountIds },
+            OR: [{ pending: true }, { plaidTransactionId: { in: referencedIds } }],
           },
         });
-      }
+        const existingMap = new Map<string, typeof existingTxs[0]>();
+        existingTxs.forEach((t) => {
+          if (t.plaidTransactionId) existingMap.set(t.plaidTransactionId, t);
+        });
 
-      // Incremental changes since the last sync (first run after this upgrade = full history)
-      const changes = await fetchTransactionChanges(rawAccessToken, item.transactionsCursor);
+        const newTransactions: Prisma.TransactionCreateManyInput[] = [];
+        const updatedTransactions: { id: string; data: Prisma.TransactionUpdateInput }[] = [];
+        const matchedDbIds = new Set<string>();
 
-      const dbAccounts = await db.account.findMany({
-        where: { bankItemId: item.id },
-      });
-      const dbAccountIds = dbAccounts.map((a) => a.id);
-      const dbAccountByPlaid = new Map(dbAccounts.map((a) => [a.plaidAccountId, a]));
+        for (const tx of incoming) {
+          const dbAccount = dbAccountByPlaid.get(tx.account_id);
+          if (!dbAccount) continue;
 
-      // Only load rows the changes can touch: same Plaid ids, the pending rows they may
-      // replace (by pending_transaction_id or proximity match), and removed ids.
-      const incoming = [...changes.added, ...changes.modified];
-      const referencedIds = [
-        ...incoming.map((t) => t.transaction_id),
-        ...(incoming.map((t) => t.pending_transaction_id).filter(Boolean) as string[]),
-      ];
-      const existingTxs = await db.transaction.findMany({
-        where: {
-          accountId: { in: dbAccountIds },
-          OR: [{ pending: true }, { plaidTransactionId: { in: referencedIds } }],
-        },
-      });
-      const existingMap = new Map<string, typeof existingTxs[0]>();
-      existingTxs.forEach((t) => {
-        if (t.plaidTransactionId) existingMap.set(t.plaidTransactionId, t);
-      });
+          // Plaid's current taxonomy first; the deprecated legacy category only as a fallback
+        const rawCategory = mapPersonalFinanceCategory(tx.personal_finance_category) ?? (tx.category ? tx.category[0] : "General");
+          const txMerchant = tx.merchant_name || tx.name || "";
 
-      const newTransactions: Prisma.TransactionCreateManyInput[] = [];
-      const updatedTransactions: { id: string; data: Prisma.TransactionUpdateInput }[] = [];
-      const matchedDbIds = new Set<string>();
+          const existingTx = findExistingTransaction(tx, dbAccount.id, existingMap, existingTxs, matchedDbIds);
 
-      for (const tx of incoming) {
-        const dbAccount = dbAccountByPlaid.get(tx.account_id);
-        if (!dbAccount) continue;
-
-        const rawCategory = tx.category ? tx.category[0] : "General";
-        const txMerchant = tx.merchant_name || tx.name || "";
-
-        const existingTx = findExistingTransaction(tx, dbAccount.id, existingMap, existingTxs, matchedDbIds);
-
-        if (existingTx) {
-          matchedDbIds.add(existingTx.id);
-          // Preserve all user manual edits (category, tags, reviewed, dates)
-          const normalizedDate = normalizeTransactionDate(
-            txMerchant,
-            existingTx.category,
-            existingTx.pending ? new Date(tx.date) : existingTx.date
-          );
-          updatedTransactions.push({
-            id: existingTx.id,
-            data: {
+          if (existingTx) {
+            matchedDbIds.add(existingTx.id);
+            // Preserve all user manual edits (category, tags, reviewed, dates). A pending row
+            // takes the posted date; a posted row keeps its stored (possibly edited) date.
+            const normalizedDate = existingTx.pending
+              ? normalizeTransactionDate(txMerchant, existingTx.category, new Date(tx.date))
+              : existingTx.date;
+            updatedTransactions.push({
+              id: existingTx.id,
+              data: {
+                plaidTransactionId: tx.transaction_id,
+                amount: tx.amount,
+                date: normalizedDate,
+                name: tx.name,
+                merchantName: tx.merchant_name || null,
+                pending: tx.pending,
+              },
+            });
+          } else {
+            const ruleCategory = applyRules(tx.name, tx.merchant_name || null, categoryRules);
+            const initialCategory = ruleCategory ? ruleCategory : mapPlaidCategoryToStandard(rawCategory, txMerchant);
+            const normalizedDate = normalizeTransactionDate(txMerchant, initialCategory, new Date(tx.date));
+            newTransactions.push({
+              accountId: dbAccount.id,
               plaidTransactionId: tx.transaction_id,
               amount: tx.amount,
               date: normalizedDate,
               name: tx.name,
               merchantName: tx.merchant_name || null,
+              category: initialCategory,
               pending: tx.pending,
-            },
-          });
-        } else {
-          const ruleCategory = applyRules(tx.name, tx.merchant_name || null, categoryRules);
-          const initialCategory = ruleCategory ? ruleCategory : mapPlaidCategoryToStandard(rawCategory, txMerchant);
-          const normalizedDate = normalizeTransactionDate(txMerchant, initialCategory, new Date(tx.date));
-          newTransactions.push({
-            accountId: dbAccount.id,
-            plaidTransactionId: tx.transaction_id,
-            amount: tx.amount,
-            date: normalizedDate,
-            name: tx.name,
-            merchantName: tx.merchant_name || null,
-            category: initialCategory,
-            pending: tx.pending,
+            });
+          }
+        }
+
+        if (newTransactions.length > 0) {
+          await db.transaction.createMany({ data: newTransactions, skipDuplicates: true });
+        }
+        const CHUNK_SIZE = 50;
+        for (let i = 0; i < updatedTransactions.length; i += CHUNK_SIZE) {
+          await db.$transaction(
+            updatedTransactions.slice(i, i + CHUNK_SIZE).map((u) => db.transaction.update({ where: { id: u.id }, data: u.data }))
+          );
+        }
+
+        // Transactions the bank removed (reversed charges, expired holds, pending rows replaced
+        // by a posted one we didn't match). Rows we just re-pointed at a new id are unaffected.
+        if (changes.removed.length > 0) {
+          await db.transaction.deleteMany({
+            where: { accountId: { in: dbAccountIds }, plaidTransactionId: { in: changes.removed } },
           });
         }
-      }
 
-      if (newTransactions.length > 0) {
-        await db.transaction.createMany({ data: newTransactions, skipDuplicates: true });
-      }
-      const CHUNK_SIZE = 50;
-      for (let i = 0; i < updatedTransactions.length; i += CHUNK_SIZE) {
-        await db.$transaction(
-          updatedTransactions.slice(i, i + CHUNK_SIZE).map((u) => db.transaction.update({ where: { id: u.id }, data: u.data }))
-        );
-      }
+        // Only advance the cursor once everything above is saved, so a failure retries the same changes
+        await db.bankItem.update({ where: { id: item.id }, data: { transactionsCursor: changes.nextCursor } });
 
-      // Transactions the bank removed (reversed charges, expired holds, pending rows replaced
-      // by a posted one we didn't match). Rows we just re-pointed at a new id are unaffected.
-      if (changes.removed.length > 0) {
-        await db.transaction.deleteMany({
-          where: { accountId: { in: dbAccountIds }, plaidTransactionId: { in: changes.removed } },
-        });
-      }
+        // Holdings & investment activity — a failure here shouldn't fail the cash sync
+        try {
+          const status = await syncInvestmentsForItem(rawAccessToken, dbAccounts);
+          if (status !== "no_accounts") investments[item.id] = status;
+          await db.bankItem
+            .update({ where: { id: item.id }, data: { investmentsStatus: status === "no_accounts" ? null : status } })
+            .catch(() => {});
+        } catch (err: any) {
+          console.error(`Investments sync failed for ${item.id}:`, err?.response?.data?.error_code || err);
+        }
 
-      // Only advance the cursor once everything above is saved, so a failure retries the same changes
-      await db.bankItem.update({ where: { id: item.id }, data: { transactionsCursor: changes.nextCursor } });
+        syncedTransactionsCount += newTransactions.length;
+        changedTransactionsCount += incoming.length + changes.removed.length;
+        for (const t of newTransactions) {
+          if (!t.pending) addedTransactions.push({ name: t.merchantName || t.name, amount: t.amount });
+        }
 
-      // Holdings & investment activity — a failure here shouldn't fail the cash sync
-      try {
-        const status = await syncInvestmentsForItem(rawAccessToken, dbAccounts);
-        if (status !== "no_accounts") investments[item.id] = status;
-        await db.bankItem
-          .update({ where: { id: item.id }, data: { investmentsStatus: status === "no_accounts" ? null : status } })
-          .catch(() => {});
+        await db.bankItem.update({
+          where: { id: item.id },
+          data: { status: "active" },
+        }).catch(() => {});
+
+        ok = true;
       } catch (err: any) {
-        console.error(`Investments sync failed for ${item.id}:`, err?.response?.data?.error_code || err);
+        console.error(`Failed to sync bank item ${item.id}:`, err?.response?.data?.error_code || err);
+        ok = false;
+        await reportError({ source: "Bank sync", message: `${item.institutionName}: ${errorText(err)}` });
+        // ITEM_LOGIN_REQUIRED means the user must re-authenticate via Link update mode
+        const code = err?.response?.data?.error_code;
+        await db.bankItem.update({
+          where: { id: item.id },
+          data: { status: code === "ITEM_LOGIN_REQUIRED" ? "item_login_required" : "error" },
+        }).catch(() => {});
       }
-
-      syncedTransactionsCount += newTransactions.length;
-      for (const t of newTransactions) {
-        if (!t.pending) addedTransactions.push({ name: t.merchantName || t.name, amount: t.amount });
-      }
-
-      await db.bankItem.update({
-        where: { id: item.id },
-        data: { status: "active" },
-      }).catch(() => {});
-
-      syncedItemsCount++;
-    } catch (err: any) {
-      console.error(`Failed to sync bank item ${item.id}:`, err?.response?.data?.error_code || err);
-      failedItems.push(item.institutionName);
-      await reportError({ source: "Bank sync", message: `${item.institutionName}: ${errorText(err)}` });
-      // ITEM_LOGIN_REQUIRED means the user must re-authenticate via Link update mode
-      const code = err?.response?.data?.error_code;
-      await db.bankItem.update({
-        where: { id: item.id },
-        data: { status: code === "ITEM_LOGIN_REQUIRED" ? "item_login_required" : "error" },
-      }).catch(() => {});
-    }
+    });
+    // A run that found the item busy leaves it to the holder, which syncs it again
+    if (!ran || ok) syncedItemsCount++;
+    else failedItems.push(listed.institutionName);
   }
 
   await recordPortfolioSnapshot().catch((err) => console.error("Portfolio snapshot failed:", err));
-  // New charges may start or end a recurring bill
-  if (syncedTransactionsCount > 0) {
+  // New, changed or reversed charges may start or end a recurring bill, or move a budget
+  if (changedTransactionsCount > 0) {
     await detectAndSyncSubscriptions().catch(() => {});
     await checkBudgetAlerts().catch((err) => console.error("Budget alerts failed:", err));
     await checkForecastAlert().catch((err) => console.error("Forecast alert failed:", err));

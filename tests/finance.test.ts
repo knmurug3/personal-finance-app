@@ -23,12 +23,24 @@ describe("isPendingMatch", () => {
     expect(isPendingMatch(tx({}), tx({ accountId: "b" }))).toBe(false);
     expect(isPendingMatch(tx({}), tx({ date: "2026-08-20" }))).toBe(false);
   });
+  it("never matches a posted row dated well before the pending one", () => {
+    expect(isPendingMatch(tx({ date: "2026-08-12" }), tx({ date: "2026-08-10" }))).toBe(false);
+    expect(isPendingMatch(tx({ date: "2026-08-11" }), tx({ date: "2026-08-10" }))).toBe(true);
+  });
 });
 
 describe("deduplicatePendingTransactions", () => {
   it("drops pending rows that have posted", () => {
     const rows = [tx({ id: "p", pending: true }), tx({ id: "q" }), tx({ id: "r", name: "Other Place", pending: true })];
     expect(deduplicatePendingTransactions(rows).map((r) => r.id)).toEqual(["q", "r"]);
+  });
+  it("lets one posted row hide only one pending row", () => {
+    const rows = [
+      tx({ id: "p1", pending: true, date: "2026-08-10" }),
+      tx({ id: "p2", pending: true, date: "2026-08-11" }),
+      tx({ id: "q", date: "2026-08-11" }),
+    ];
+    expect(deduplicatePendingTransactions(rows).map((r) => r.id)).toEqual(["p1", "q"]);
   });
 });
 

@@ -6,6 +6,8 @@ import { apiError } from "@/lib/apiError";
 import { requireAuth } from "@/lib/requireAuth";
 import { cleanString, cleanTags } from "@/lib/validate";
 import { findDuplicatePendingIds } from "@/lib/financeUtils";
+import { appTodayDate } from "@/lib/appTime";
+import { PENDING_MATCH_WINDOW_DAYS } from "@/lib/pendingMatch";
 import type { Prisma } from "@prisma/client";
 
 export const dynamic = "force-dynamic";
@@ -42,12 +44,24 @@ export async function GET(req: Request) {
       ];
     }
 
-    // Hide pending rows that already posted. Computed over all rows (not just this page)
-    // so pagination and totals stay consistent.
-    const lite = await db.transaction.findMany({
-      select: { id: true, accountId: true, amount: true, date: true, name: true, merchantName: true, pending: true },
-    });
-    const hiddenIds = Array.from(findDuplicatePendingIds(lite));
+    // Hide pending rows that already posted. Computed over every pending row (not just this
+    // page) so pagination and totals stay consistent; only posted rows near them can match.
+    const select = { id: true, accountId: true, amount: true, date: true, name: true, merchantName: true, pending: true };
+    const pendingRows = await db.transaction.findMany({ where: { pending: true }, select });
+    let hiddenIds: string[] = [];
+    if (pendingRows.length > 0) {
+      const times = pendingRows.map((t) => t.date.getTime());
+      const DAY_MS = 86_400_000;
+      const postedNear = await db.transaction.findMany({
+        where: {
+          pending: false,
+          accountId: { in: Array.from(new Set(pendingRows.map((t) => t.accountId))) },
+          date: { gte: new Date(Math.min(...times) - DAY_MS), lte: new Date(Math.max(...times) + PENDING_MATCH_WINDOW_DAYS * DAY_MS) },
+        },
+        select,
+      });
+      hiddenIds = Array.from(findDuplicatePendingIds([...pendingRows, ...postedNear]));
+    }
     if (hiddenIds.length > 0) where.id = { notIn: hiddenIds };
 
     const transactions = (await db.transaction.findMany({
@@ -106,7 +120,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid amount value." }, { status: 400 });
     }
 
-    const parsedDate = date ? new Date(date) : new Date();
+    // Calendar dates are stored at UTC midnight; "today" is the owner's today
+    const parsedDate = date ? new Date(date) : appTodayDate();
     if (isNaN(parsedDate.getTime())) {
       return NextResponse.json({ error: "Invalid date format." }, { status: 400 });
     }
@@ -225,29 +240,32 @@ export async function PUT(req: Request) {
           );
         }
       }
-      await db.transactionSplit.deleteMany({
-        where: { transactionId: id },
-      });
-
-      if (splits.length > 0) {
-        await db.transactionSplit.createMany({
-          data: splits.map((s: any) => ({
-            transactionId: id,
-            category: s.category,
-            amount: parseFloat(s.amount),
-            notes: s.notes || null,
-          })),
-        });
-      }
     }
 
-    const updatedTx = await db.transaction.update({
-      where: { id },
-      data: updateData,
-      include: {
-        account: true,
-        splits: true,
-      },
+    // Splits and the transaction change together, so a failure can't leave it without splits
+    const replaceSplits = Array.isArray(splits);
+    const updatedTx = await db.$transaction(async (tx) => {
+      if (replaceSplits) {
+        await tx.transactionSplit.deleteMany({ where: { transactionId: id } });
+        if (splits.length > 0) {
+          await tx.transactionSplit.createMany({
+            data: splits.map((s: any) => ({
+              transactionId: id,
+              category: s.category,
+              amount: parseFloat(s.amount),
+              notes: s.notes || null,
+            })),
+          });
+        }
+      }
+      return tx.transaction.update({
+        where: { id },
+        data: updateData,
+        include: {
+          account: true,
+          splits: true,
+        },
+      });
     });
 
     if (createRule && typeof merchantPattern === "string" && merchantPattern.length <= 100 && typeof category === "string") {

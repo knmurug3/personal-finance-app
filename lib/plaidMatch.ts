@@ -5,12 +5,17 @@
 
 import { isPendingMatch } from "./pendingMatch";
 
+// Whole words only: "rent" must not catch Parent, Current or Torrent, nor a rental car
+const RENT_NAME = /\b(rent(?!\s*a\s*car)|housing)\b/;
+
+/**
+ * Rent paid at the end of a month is for the next one: dates on/after the 26th move to the 1st.
+ * Dates are calendar days at UTC midnight, so this works in UTC regardless of server zone.
+ */
 export function normalizeTransactionDate(txName: string, category: string, rawDate: Date): Date {
-  const name = txName.toLowerCase();
-  const cat = category.toLowerCase();
-  if (name.includes("rent") || name.includes("housing") || cat.includes("housing")) {
-    if (rawDate.getDate() >= 26) {
-      return new Date(rawDate.getFullYear(), rawDate.getMonth() + 1, 1);
+  if (RENT_NAME.test(txName.toLowerCase()) || category.toLowerCase().includes("housing")) {
+    if (rawDate.getUTCDate() >= 26) {
+      return new Date(Date.UTC(rawDate.getUTCFullYear(), rawDate.getUTCMonth() + 1, 1));
     }
   }
   return rawDate;

@@ -27,8 +27,10 @@ export function merchantKeywords(...parts: (string | null | undefined)[]): strin
 
 export function isPendingMatch(pending: MatchableTx, posted: MatchableTx): boolean {
   if (pending.accountId !== posted.accountId) return false;
-  const daysDiff = Math.abs(new Date(pending.date).getTime() - new Date(posted.date).getTime()) / DAY_MS;
-  if (daysDiff > PENDING_MATCH_WINDOW_DAYS) return false;
+  // A charge posts on or after it was authorised (a day of slack for banks that backdate)
+  const lag = (new Date(posted.date).getTime() - new Date(pending.date).getTime()) / DAY_MS;
+  if (lag < -1 || lag > PENDING_MATCH_WINDOW_DAYS) return false;
+  const daysDiff = Math.abs(lag);
 
   const pTokens = merchantKeywords(pending.name, pending.merchantName);
   const qTokens = merchantKeywords(posted.name, posted.merchantName);

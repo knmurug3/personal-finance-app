@@ -3,7 +3,8 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { ArrowUp, MessageCircle, RotateCcw, KeyRound } from "lucide-react";
 
-type Msg = { role: "user" | "assistant"; content: string; error?: boolean };
+// sig: the server's signature on an answer; sent back so it counts as conversation history
+type Msg = { role: "user" | "assistant"; content: string; error?: boolean; sig?: string };
 
 const SUGGESTIONS = [
   "How much did I spend on food last month?",
@@ -89,7 +90,7 @@ export function AskView({ initialQuestion, onConsumeInitial }: { initialQuestion
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history.map(({ role, content }) => ({ role, content })) }),
+        body: JSON.stringify({ messages: history.map(({ role, content, sig }) => ({ role, content, sig })) }),
       });
       if (!res.ok || !res.body) {
         const body = await res.json().catch(() => ({}));
@@ -117,6 +118,14 @@ export function AskView({ initialQuestion, onConsumeInitial }: { initialQuestion
             setStatus(ev.text);
           } else if (ev.type === "break") {
             update((prev) => (prev && !prev.endsWith("\n\n") ? prev + "\n\n" : prev));
+          } else if (ev.type === "done") {
+            // Keep the server's copy so the signature matches it exactly
+            setMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (!last.error) next[next.length - 1] = { ...last, content: ev.text ?? last.content, sig: ev.sig };
+              return next;
+            });
           } else if (ev.type === "error") {
             update((prev) => (prev ? `${prev}\n\n${ev.text}` : ev.text), true);
           }

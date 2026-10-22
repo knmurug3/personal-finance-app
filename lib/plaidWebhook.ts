@@ -3,8 +3,10 @@ import { plaidClient } from "@/lib/plaid";
 
 // Plaid signs webhooks with an ES256 JWT in the `Plaid-Verification` header.
 // https://plaid.com/docs/api/webhooks/webhook-verification/
-const keyCache = new Map<string, crypto.KeyObject>();
+const keyCache = new Map<string, { key: crypto.KeyObject; fetchedAt: number }>();
 const MAX_AGE_SECONDS = 5 * 60;
+// Plaid rotates keys; re-fetch a cached one daily so an expired key stops being trusted
+const KEY_RECHECK_MS = 24 * 60 * 60 * 1000;
 
 function b64url(input: string): Buffer {
   return Buffer.from(input.replace(/-/g, "+").replace(/_/g, "/"), "base64");
@@ -25,13 +27,17 @@ export async function verifyPlaidWebhook(rawBody: string, jwt: string | null): P
   }
   if (header.alg !== "ES256" || !header.kid) return false;
 
-  let key = keyCache.get(header.kid);
+  const cached = keyCache.get(header.kid);
+  let key = cached && Date.now() - cached.fetchedAt < KEY_RECHECK_MS ? cached.key : undefined;
   if (!key) {
     const res = await plaidClient.webhookVerificationKeyGet({ key_id: header.kid });
     const jwk = res.data.key as any;
-    if (jwk.expired_at) return false;
+    if (jwk.expired_at) {
+      keyCache.delete(header.kid);
+      return false;
+    }
     key = crypto.createPublicKey({ key: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y }, format: "jwk" });
-    keyCache.set(header.kid, key);
+    keyCache.set(header.kid, { key, fetchedAt: Date.now() });
   }
 
   const signatureValid = crypto.verify(

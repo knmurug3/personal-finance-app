@@ -8,97 +8,40 @@ export function mapPlaidCategoryToStandard(
   const lower = c.toLowerCase();
 
   // 1. High-Priority Merchant Name Matching Rules (PERMANENT GUARDS)
-  if (
-    name.includes("dividend") ||
-    name.includes("interest earned") ||
-    name.includes("yield")
-  ) {
+  // Matched at word boundaries: plain substrings caught Parent/Current as rent, medicine as
+  // cinema, Las Vegas as gas, Crossfit as Ross and Paws as AWS.
+  if (/\bdividend|\binterest earned|\byield\b/.test(name)) {
     return "Income";
   }
 
-  if (
-    name.includes("you sold") ||
-    name.includes("you bought") ||
-    name.includes("purchase into core") ||
-    name.includes("redemption from core") ||
-    name.includes("reinvestment") ||
-    name.includes("tax withheld")
-  ) {
+  if (/you sold|you bought|purchase into core|redemption from core|\breinvest|tax withheld/.test(name)) {
     return "Transfers";
   }
 
-  if (
-    name.includes("rent") ||
-    name.includes("mortgage") ||
-    name.includes("apartment") ||
-    name.includes("housing") ||
-    name.includes("property management")
-  ) {
+  if (/\brent\b(?!\s*a\s*car)|\bmortgage|\bapartment|\bhousing\b|property management/.test(name)) {
     return "Housing";
   }
 
   if (
-    name.includes("trader joe") ||
-    name.includes("whole foods") ||
-    name.includes("aldi") ||
-    name.includes("kroger") ||
-    name.includes("safeway") ||
-    name.includes("publix") ||
-    name.includes("supermarket") ||
-    (name.includes("costco") && !name.includes("gas"))
+    /trader joe|whole foods|\baldi\b|\bkroger\b|\bsafeway\b|\bpublix\b|supermarket/.test(name) ||
+    (/\bcostco\b/.test(name) && !/\bgas\b/.test(name))
   ) {
     return "Grocery";
   }
 
-  if (
-    name.includes("gas") ||
-    name.includes("car wash") ||
-    name.includes("napa") ||
-    name.includes("shell") ||
-    name.includes("chevron") ||
-    name.includes("exxon") ||
-    name.includes("bp ") ||
-    name.includes("uber") ||
-    name.includes("lyft")
-  ) {
+  if (/\bgas(oline)?\b|car wash|\bnapa\b|\bshell\b|\bchevron\b|\bexxon|\bbp\b|\buber\b(?!\s*eats)|\blyft\b/.test(name)) {
     return "Transport";
   }
 
-  if (
-    name.includes("cine") ||
-    name.includes("theater") ||
-    name.includes("cinema") ||
-    name.includes("bowling") ||
-    name.includes("disney") ||
-    name.includes("netflix") ||
-    name.includes("hulu") ||
-    name.includes("spotify")
-  ) {
+  if (/\bcine|\btheat(er|re)\b|\bbowling\b|\bdisney|\bnetflix|\bhulu\b|\bspotify/.test(name)) {
     return "Entertainment";
   }
 
-  if (
-    name.includes("anthropic") ||
-    name.includes("claude") ||
-    name.includes("openai") ||
-    name.includes("chatgpt") ||
-    name.includes("github") ||
-    name.includes("aws") ||
-    name.includes("google cloud")
-  ) {
+  if (/\banthropic|\bclaude\b|\bopenai|\bchatgpt|\bgithub|\baws\b|google cloud/.test(name)) {
     return "Utilities";
   }
 
-  if (
-    name.includes("ross") ||
-    name.includes("tj maxx") ||
-    name.includes("marshalls") ||
-    name.includes("nordstrom") ||
-    name.includes("macys") ||
-    name.includes("amazon") ||
-    name.includes("target") ||
-    name.includes("walmart")
-  ) {
+  if (/\bross\b|\btj ?maxx|\bmarshalls|\bnordstrom|\bmacy'?s\b|\bamazon|\btarget\b|\bwalmart/.test(name)) {
     return "Shopping";
   }
 
@@ -203,7 +146,7 @@ export function mapPlaidCategoryToStandard(
   if (
     lower.includes("house") ||
     lower.includes("housing") ||
-    lower.includes("rent") ||
+    /\brent\b/.test(lower) ||
     lower.includes("mortgage") ||
     lower.includes("property")
   ) {
@@ -230,4 +173,40 @@ export function mapPlaidCategoryToStandard(
   }
 
   return "General";
+}
+
+/**
+ * App category for Plaid's personal_finance_category (the current taxonomy; the legacy
+ * `category` array is deprecated). Null when it doesn't map cleanly, so the caller falls
+ * back to the legacy category. https://plaid.com/documents/transactions-personal-finance-category-taxonomy.csv
+ */
+export function mapPersonalFinanceCategory(pfc: { primary?: string; detailed?: string } | null | undefined): string | null {
+  const primary = pfc?.primary || "";
+  const detailed = pfc?.detailed || "";
+  switch (primary) {
+    case "INCOME":
+      return "Income";
+    case "TRANSFER_IN":
+    case "TRANSFER_OUT":
+      return "Transfers";
+    case "LOAN_PAYMENTS":
+      // Paying a credit card moves money between the owner's accounts; the card's purchases are the spending
+      if (detailed === "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT") return "Transfers";
+      if (detailed === "LOAN_PAYMENTS_MORTGAGE_PAYMENT") return "Housing";
+      if (detailed === "LOAN_PAYMENTS_CAR_PAYMENT") return "Transport";
+      return null;
+    case "FOOD_AND_DRINK":
+      return detailed === "FOOD_AND_DRINK_GROCERIES" ? "Grocery" : "Food & Dining";
+    case "GENERAL_MERCHANDISE":
+      return "Shopping";
+    case "ENTERTAINMENT":
+      return "Entertainment";
+    case "TRANSPORTATION":
+    case "TRAVEL":
+      return "Transport";
+    case "RENT_AND_UTILITIES":
+      return detailed === "RENT_AND_UTILITIES_RENT" ? "Housing" : "Utilities";
+    default:
+      return null;
+  }
 }

@@ -69,6 +69,30 @@ export async function POST(req: Request) {
       }
     } else if (code === "LOGIN_REPAIRED") {
       await db.bankItem.update({ where: { itemId }, data: { status: "active" } }).catch(() => {});
+    } else if (code === "NEW_ACCOUNTS_AVAILABLE") {
+      // The bank has accounts the owner hasn't shared yet; "choose accounts" (Link update mode) adds them
+      const item = await db.bankItem.findUnique({ where: { itemId } }).catch(() => null);
+      if (item) {
+        after(() =>
+          sendPushToAll({
+            title: `New accounts at ${item.institutionName}`,
+            body: "Choose which ones to add to Personal Finance.",
+            url: "/?tab=accounts",
+          }).catch(() => {})
+        );
+      }
+    } else if (code === "USER_PERMISSION_REVOKED" || code === "USER_ACCOUNT_REVOKED") {
+      // Access was revoked at the bank or on my.plaid.com; this connection can't sync again
+      const item = await db.bankItem.update({ where: { itemId }, data: { status: "disconnected" } }).catch(() => null);
+      if (item) {
+        after(() =>
+          sendPushToAll({
+            title: `${item.institutionName} disconnected`,
+            body: "Access was revoked. Connect the bank again to keep syncing.",
+            url: "/?tab=accounts",
+          }).catch(() => {})
+        );
+      }
     }
   }
 
