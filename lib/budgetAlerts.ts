@@ -21,6 +21,21 @@ export function alertMessage(category: string, spent: number, limit: number, lev
 }
 
 /**
+ * Atomically records that `level` was reached; true only for the one caller that raised it,
+ * so two syncs finishing together can't both send the same alert.
+ */
+async function claimAlert(key: string, level: number): Promise<boolean> {
+  try {
+    await db.appMeta.create({ data: { key, value: String(level) } });
+    return true;
+  } catch {
+    const lower = ALERT_LEVELS.filter((l) => l < level).map(String);
+    const { count } = await db.appMeta.updateMany({ where: { key, value: { in: lower } }, data: { value: String(level) } });
+    return count === 1;
+  }
+}
+
+/**
  * Notifies once per category per level per month when spending crosses 80% / 100%.
  * Remembered in AppMeta so repeated syncs don't repeat the alert.
  */
@@ -32,9 +47,7 @@ export async function checkBudgetAlerts(): Promise<number> {
     const level = alertLevel(b.spent, b.effectiveLimit);
     if (!level) continue;
     const key = `budgetAlert:${today.monthKey}:${b.category}`;
-    const prev = Number((await db.appMeta.findUnique({ where: { key } }))?.value ?? 0);
-    if (level <= prev) continue;
-    await db.appMeta.upsert({ where: { key }, create: { key, value: String(level) }, update: { value: String(level) } });
+    if (!(await claimAlert(key, level))) continue;
     await sendPushToAll({ ...alertMessage(b.category, b.spent, b.effectiveLimit, level), url: "/?tab=budgets" });
     sent++;
   }

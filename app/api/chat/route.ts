@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/lib/db";
 import { requireAuth, getSessionUsername, clientIp } from "@/lib/requireAuth";
+import { sanitizeHistory, signAnswer } from "@/lib/ask/history";
 import { loadSnapshot, type AskSnapshot } from "@/lib/ask/data";
 import { ASK_TOOLS, TOOL_LABELS, runAskTool } from "@/lib/ask/tools";
 import { APP_TIMEZONE } from "@/lib/appTime";
@@ -12,8 +13,6 @@ export const maxDuration = 120;
 // Claude Sonnet 5.5 by default; override with ASK_MODEL (e.g. "claude-opus-5-5") without a code change
 const MODEL = process.env.ASK_MODEL || "claude-sonnet-5-5";
 const MAX_TURNS = 8; // model ↔ tool round trips per question
-const MAX_HISTORY = 20;
-const MAX_CHARS = 2000;
 const OWNER_DAILY_LIMIT = Number(process.env.ASK_DAILY_LIMIT || 100);
 const DEMO_DAILY_LIMIT = Number(process.env.ASK_DEMO_DAILY_LIMIT || 30); // shared by all demo visitors
 const DEMO_IP_DAILY_LIMIT = Number(process.env.ASK_DEMO_IP_DAILY_LIMIT || 5); // so one visitor can't use up the shared pool
@@ -32,20 +31,6 @@ Style:
 - Format money like $1,234.56. Use the user's category names as-is.
 - Be concise and warm, like a sharp friend who's good with money. No disclaimers unless the user asks for advice that genuinely needs one (taxes, legal, specific securities to buy or sell) — then add one short line.
 - Resolve relative dates ("last month", "this year") from today's date given below.`;
-
-type ChatMessage = { role: "user" | "assistant"; content: string };
-
-function sanitizeHistory(raw: unknown): ChatMessage[] | null {
-  if (!Array.isArray(raw) || raw.length === 0) return null;
-  const msgs = raw.slice(-MAX_HISTORY).map((m) => ({
-    role: m?.role === "assistant" ? ("assistant" as const) : ("user" as const),
-    content: typeof m?.content === "string" ? m.content.slice(0, MAX_CHARS) : "",
-  }));
-  // Must start with a user turn and end with the new question
-  while (msgs.length && msgs[0].role !== "user") msgs.shift();
-  if (!msgs.length || msgs[msgs.length - 1].role !== "user" || !msgs[msgs.length - 1].content.trim()) return null;
-  return msgs.filter((m) => m.content.trim());
-}
 
 /** Atomically counts today's question against one bucket; false once its cap is reached. */
 async function takeQuota(bucket: string, limit: number): Promise<boolean> {
@@ -105,6 +90,12 @@ export async function POST(req: Request) {
     async start(controller) {
       // Newline-delimited JSON events: {type:"text"|"status"|"done"|"error", ...}
       const send = (event: Record<string, unknown>) => controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
+      // The answer exactly as the client assembles it, so it can be signed at the end
+      let answer = "";
+      const sendText = (text: string) => {
+        answer += text;
+        send({ type: "text", text });
+      };
       let snapshot: AskSnapshot | null = null;
       const messages: Anthropic.Beta.BetaMessageParam[] = history.map((m) => ({ role: m.role, content: m.content }));
 
@@ -128,7 +119,7 @@ export async function POST(req: Request) {
             messages,
           });
 
-          response.on("text", (delta) => send({ type: "text", text: delta }));
+          response.on("text", (delta) => sendText(delta));
           let message: Anthropic.Beta.BetaMessage;
           try {
             message = await response.finalMessage();
@@ -142,7 +133,7 @@ export async function POST(req: Request) {
           }
 
           if (message.stop_reason === "refusal") {
-            send({ type: "text", text: "\n\nI can't help with that one. Try asking about your spending, budgets, accounts, or investments." });
+            sendText("\n\nI can't help with that one. Try asking about your spending, budgets, accounts, or investments.");
             break;
           }
 
@@ -150,7 +141,7 @@ export async function POST(req: Request) {
           if (toolUses.length === 0) break; // end_turn / max_tokens on a text answer
 
           if (message.stop_reason === "max_tokens") {
-            send({ type: "text", text: "\n\n(That answer got too long. Try a narrower question.)" });
+            sendText("\n\n(That answer got too long. Try a narrower question.)");
             break;
           }
 
@@ -165,8 +156,9 @@ export async function POST(req: Request) {
           });
           messages.push({ role: "user", content: results });
           send({ type: "break" });
+          if (answer && !answer.endsWith("\n\n")) answer += "\n\n";
         }
-        send({ type: "done" });
+        send({ type: "done", text: answer, sig: signAnswer(answer) });
       } catch (err) {
         console.error("Ask error:", err instanceof Anthropic.APIError ? `${err.status} ${err.message}` : err);
         if (!(err instanceof Anthropic.RateLimitError)) {

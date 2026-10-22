@@ -99,7 +99,8 @@ export function getSpendingAmount(tx: { amount: number }): number {
 
 /**
  * Returns the ids of pending transactions that have a posted counterpart
- * (same purchase, tip adjustment, or $0 pre-auth hold).
+ * (same purchase, tip adjustment, or $0 pre-auth hold). Matching is one-to-one, so two
+ * identical purchases a few days apart (daily coffee, transit fares) don't hide each other.
  */
 export function findDuplicatePendingIds<
   T extends {
@@ -113,9 +114,22 @@ export function findDuplicatePendingIds<
   }
 >(transactions: T[]): Set<string> {
   const posted = transactions.filter((t) => !t.pending);
-  const ids = new Set<string>();
+  const time = (t: T) => new Date(t.date).getTime();
+  const pairs: { pending: T; posted: T; gap: number }[] = [];
   for (const t of transactions) {
-    if (t.pending && posted.some((p) => isPendingMatch(t, p))) ids.add(t.id);
+    if (!t.pending) continue;
+    for (const p of posted) {
+      if (isPendingMatch(t, p)) pairs.push({ pending: t, posted: p, gap: Math.abs(time(p) - time(t)) });
+    }
+  }
+  // Closest pairs claim each other first
+  pairs.sort((a, b) => a.gap - b.gap);
+  const used = new Set<string>();
+  const ids = new Set<string>();
+  for (const { pending, posted: p } of pairs) {
+    if (ids.has(pending.id) || used.has(p.id)) continue;
+    used.add(p.id);
+    ids.add(pending.id);
   }
   return ids;
 }
